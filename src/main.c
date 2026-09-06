@@ -19,8 +19,7 @@ static void usage(const char *argv0) {
     printf("usage: %s [--check]\n"
            "\n"
            "Serves the Wayland session it is started in over RDP. Port, username\n"
-           "and password come from ~/.config/wayrdp/wayrdp.conf, which the wfkit\n"
-           "panel writes.\n"
+           "and password come from ~/.config/wayrdp/wayrdp.conf.\n"
            "\n"
            "  --check   report whether this compositor and this configuration can\n"
            "            serve, and exit without listening\n", argv0);
@@ -74,8 +73,8 @@ int main(int argc, char **argv) {
     // Refusing to start is the right answer to a half-filled form: a desktop
     // listening with no password is worse than one that is not listening.
     if (!usable) {
-        fprintf(stderr, "wayrdp: not starting -- %s. Set it in the panel, "
-                        "or in %s\n", why, config.path);
+        fprintf(stderr, "wayrdp: not starting -- %s. Set it in %s\n",
+                why, config.path);
         wr_audio_close(audio);
         wr_close(wayland);
         return 1;

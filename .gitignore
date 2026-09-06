@@ -1,1 +1,8 @@
 build/
+
+# Package files (.SRCINFO is tracked for AUR publication).
+/*.pkg.tar.*
+/*.src.tar.*
+/wayrdp-*.tar.gz
+/*.log*
+/pkg/

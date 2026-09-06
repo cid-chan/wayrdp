@@ -4,10 +4,9 @@
 shares the desktop session that is already running: an RDP client sees the same
 screen as the local user and can control it with a remote keyboard and pointer.
 
-The project was originally written for wfkit, a Wayfire-based desktop, but the
-server is not tied to Wayfire APIs. It uses standard Wayland and wlroots
-protocols for capture and input, FreeRDP 3 for the RDP transport and RemoteFX
-encoding, and PipeWire for bidirectional audio.
+The server uses standard Wayland and wlroots protocols for capture and input,
+FreeRDP 3 for the RDP transport and RemoteFX encoding, and PipeWire for
+bidirectional audio. It is not tied to a particular desktop shell.
 
 > [!IMPORTANT]
 > `wayrdp` is an early, working implementation rather than a security-audited
@@ -60,7 +59,6 @@ The following are not implemented yet:
 - concurrent clients;
 - desktop scaling or a client-selected resolution;
 - per-window capture;
-- packaging and a systemd unit in this repository;
 - an automated test suite.
 
 The first `wl_output` announced by the compositor is served at its native
@@ -173,6 +171,25 @@ Linux:
 
 On another distribution, install equivalent development packages and adjust
 `STAGING` and `WLR` in the Makefile if those files live elsewhere.
+
+## Arch Linux package
+
+An AUR package definition named `wayrdp` is available in the root
+[`PKGBUILD`](PKGBUILD). To build and install it locally from the project root:
+
+```bash
+sudo pacman -S --needed base-devel
+makepkg --syncdeps --install
+```
+
+It installs both `wayrdp` and `wayrdp-probe` under `/usr/bin`, a
+`wayrdp.service` user unit, and documentation and licenses under `/usr/share`.
+The package currently uses a fixed upstream commit and the supplied patch;
+additional local source edits are not included in this build. In the source
+checkout, `makepkg` uses `build/makepkg` to protect the project's `src/` directory.
+
+After installation, create the [per-user configuration](#configuration) and run
+`wayrdp --check` inside the Wayland session before starting the server.
 
 ## Building on Arch Linux
 
@@ -329,6 +346,23 @@ one long-lived compositor.
 
 Stop the server with `Ctrl+C`, `SIGINT` or `SIGTERM`. After a client disconnects,
 the listener remains available for the next client.
+
+The Arch package also includes a systemd user unit. After configuring the server,
+import the session environment and enable it from a terminal in that session:
+
+```bash
+systemctl --user import-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR
+systemctl --user enable --now wayrdp.service
+```
+
+Autostart uses `graphical-session.target`. If the compositor does not activate
+that target, its session startup must import the display environment and start
+the enabled unit.
+
+An existing `~/.config/systemd/user/wayrdp.service` overrides the packaged unit.
+If it hardcodes `/usr/local/bin/wayrdp`, change it to `ExecStart=wayrdp` and run
+`systemctl --user daemon-reload`. Local installations under `/usr/local/bin`
+take precedence over the packaged binary under `/usr/bin`.
 
 Connect with an RDP client to the host and configured port, supply the configured
 username and password, and verify the self-signed certificate fingerprint on

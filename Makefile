@@ -29,7 +29,9 @@ PROTO_SRCS  := $(patsubst %,$(GEN)/%-protocol.c,$(PROTO_NAMES))
 PROTO_OBJS  := $(PROTO_SRCS:.c=.o)
 
 DEPS    := wayland-client xkbcommon freerdp3 freerdp-server3 winpr3 libpipewire-0.3
-CFLAGS  += -std=c11 -Wall -Wextra -O2 -I$(GEN) -Isrc $(shell pkg-config --cflags $(DEPS))
+CFLAGS  ?= -O2
+CFLAGS  += -std=c11 -Wall -Wextra
+CPPFLAGS += -I$(GEN) -Isrc $(shell pkg-config --cflags $(DEPS))
 LDLIBS  += $(shell pkg-config --libs $(DEPS))
 
 .PHONY: all clean protocols
@@ -41,16 +43,16 @@ protocols: $(PROTO_HDRS) $(PROTO_SRCS)
 # has no way to know that from the .c alone.
 $(BUILD)/%.o: src/%.c | $(PROTO_HDRS)
 	@mkdir -p $(@D)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 $(BUILD)/wayrdp-probe: $(BUILD)/probe.o $(BUILD)/wayland.o $(PROTO_OBJS)
-	$(CC) $^ $(LDLIBS) -o $@
+	$(CC) $(CFLAGS) $(LDFLAGS) $^ $(LDLIBS) -o $@
 
 $(BUILD)/wayrdp: $(BUILD)/main.o $(BUILD)/rdp.o $(BUILD)/config.o $(BUILD)/audio.o $(BUILD)/wayland.o $(PROTO_OBJS)
-	$(CC) $^ $(LDLIBS) -o $@
+	$(CC) $(CFLAGS) $(LDFLAGS) $^ $(LDLIBS) -o $@
 
 $(GEN)/%-protocol.o: $(GEN)/%-protocol.c
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 define proto_rule
 $(GEN)/$(1)-client-protocol.h: $(2)
