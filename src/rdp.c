@@ -268,6 +268,9 @@ static bool send_frame(struct wr_server *s, const struct wr_frame *f, bool full)
         s->mirror_width = f->width;
         s->mirror_height = f->height;
         full = true;    // a resized mirror holds nothing the client has seen
+        // The encoder is sized to the same resolution: a changed output needs a
+        // fresh context or rfx_compose_message refuses the frame.
+        if (!rfx_context_reset(s->rfx, f->width, f->height)) return false;
     }
 
     RFX_RECT rects[WR_MAX_DAMAGE];
