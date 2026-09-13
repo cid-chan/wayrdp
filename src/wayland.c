@@ -49,6 +49,11 @@ struct wr_wayland {
     int bpp;
     bool have_size, have_format, session_done, session_stopped;
 
+    // Earliest monotonic time a failed capture rebuild may be attempted again.
+    // Without it the frame loop retries every call, which is a busy loop when
+    // the compositor has gone away rather than merely stopped the session.
+    int64_t reopen_retry_at_ms;
+
     // The capture buffer is allocated once and reused: a new wl_buffer per
     // frame would mean a new pool and an mmap per frame at 60Hz.
     struct wl_buffer *buffer;
@@ -103,10 +108,11 @@ void wr_read_rgb(const uint8_t *p, uint32_t format, uint8_t out[3]) {
     }
 }
 
-static uint32_t now_ms(void) {
+// Monotonic milliseconds; only differences are meaningful.
+static int64_t now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint32_t)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
 static int anonymous_shm(size_t size) {
@@ -357,6 +363,14 @@ bool wr_dispatch_pending(struct wr_wayland *w) {
     return wl_display_dispatch_pending(w->display) >= 0;
 }
 
+// True once the Wayland connection is broken for good. A dead socket cannot be
+// recovered on this display object, so the caller should stop and let its
+// supervisor start a fresh process that reconnects to whatever compositor is
+// current -- the alternative is a process that keeps serving nothing.
+bool wr_fatal(const struct wr_wayland *w) {
+    return wl_display_get_error(w->display) != 0;
+}
+
 uint32_t wr_width(const struct wr_wayland *w)  { return w->width; }
 uint32_t wr_height(const struct wr_wayland *w) { return w->height; }
 
@@ -446,17 +460,24 @@ static bool capture_reopen(struct wr_wayland *w) {
     capture_teardown(w);
     if (!start_capture_session(w, &error)) {
         capture_teardown(w);
+        // A rebuild can fail for a moment (a locked session, an output being
+        // reconfigured). Wait before the next attempt so the frame loop does
+        // not spin, and report once per attempt rather than once per frame.
+        w->reopen_retry_at_ms = now_ms() + 500;
         fprintf(stderr, "wayrdp: capture session not restarted: %s\n", error);
         return false;
     }
+    w->reopen_retry_at_ms = 0;
     fprintf(stderr, "wayrdp: capture session restarted, %ux%u\n", w->width, w->height);
     return true;
 }
 
 const struct wr_frame *wr_capture_frame(struct wr_wayland *w, int timeout_ms) {
     // A stopped session or a replaced output leaves the old capture dead. Rebuild
-    // it here instead of polling a session that will never answer again.
+    // it here instead of polling a session that will never answer again. A failed
+    // rebuild sets a short cooldown so the next frame call cannot hot-loop.
     if (!w->session || w->session_stopped) {
+        if (now_ms() < w->reopen_retry_at_ms) return NULL;
         if (!capture_reopen(w)) return NULL;
     }
 

@@ -48,6 +48,9 @@ int wr_fd(const struct wr_wayland *w);
 bool wr_flush(struct wr_wayland *w);
 bool wr_dispatch_pending(struct wr_wayland *w);
 
+// The Wayland connection is broken beyond recovery; stop and reconnect.
+bool wr_fatal(const struct wr_wayland *w);
+
 // --- capture ---------------------------------------------------------------
 
 // Negotiates size and format. Fails if the compositor offers no format this

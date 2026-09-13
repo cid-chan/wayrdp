@@ -918,7 +918,11 @@ bool wr_server_run(struct wr_server *s, const volatile bool *running) {
                           s->vcm, s->peer_activated))
             drop_peer(s);
 
-        wr_dispatch_pending(s->wayland);
+        // A dispatch error means the compositor connection is gone. Stop here so
+        // systemd restarts the unit against the current compositor, instead of
+        // polling a dead socket forever while clients see a blank screen.
+        if (!wr_dispatch_pending(s->wayland))
+            return false;
 
         if (s->peer_activated) {
             open_microphone(s);
@@ -928,6 +932,8 @@ bool wr_server_run(struct wr_server *s, const volatile bool *running) {
             const struct wr_frame *f = wr_capture_frame(s->wayland, 16);
             if (f && !send_frame(s, f, false))
                 drop_peer(s);
+            if (wr_fatal(s->wayland))
+                return false;
         }
     }
     return true;
