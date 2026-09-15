@@ -48,6 +48,7 @@ struct wr_wayland {
     uint32_t width, height, format;
     int bpp;
     bool have_size, have_format, session_done, session_stopped;
+    bool use_screencopy;
 
     // Earliest monotonic time a failed capture rebuild may be attempted again.
     // Without it the frame loop retries every call, which is a busy loop when
@@ -75,6 +76,9 @@ struct wr_wayland {
     uint32_t now_format, now_width, now_height;
     struct wr_frame now_frame;
     bool now_have_buffer, now_ready, now_failed, now_described;
+    struct wr_rect now_damage[WR_MAX_DAMAGE];
+    int now_damage_count;
+    bool now_damage_overflowed;
 };
 
 // --- helpers ---------------------------------------------------------------
@@ -426,10 +430,23 @@ static void capture_teardown(struct wr_wayland *w) {
 // Build a capture session on the current output and negotiate size and format.
 static bool start_capture_session(struct wr_wayland *w, const char **error) {
     if (!w->sources || !w->capture_manager) {
-        *error = "compositor does not offer ext-image-copy-capture "
-                 "(on Wayfire, add copy-capture to core/plugins)";
-        return false;
+        if (!w->screencopy) {
+            *error = "compositor offers neither ext-image-copy-capture nor "
+                     "wlr-screencopy";
+            return false;
+        }
+
+        w->use_screencopy = true;
+        const struct wr_frame *frame = wr_capture_now(w, 5000);
+        if (!frame) {
+            *error = "wlr-screencopy did not produce an initial frame";
+            return false;
+        }
+        w->width = frame->width;
+        w->height = frame->height;
+        return true;
     }
+    w->use_screencopy = false;
     if (!w->output) {
         *error = "no output to capture";
         return false;
@@ -500,7 +517,12 @@ static bool capture_reopen(struct wr_wayland *w) {
     return true;
 }
 
+static const struct wr_frame *capture_screencopy(
+    struct wr_wayland *w, int timeout_ms, bool with_damage);
+
 const struct wr_frame *wr_capture_frame(struct wr_wayland *w, int timeout_ms) {
+    if (w->use_screencopy)
+        return capture_screencopy(w, timeout_ms, true);
     // A stopped session or a replaced output leaves the old capture dead. Rebuild
     // it here instead of polling a session that will never answer again. A failed
     // rebuild sets a short cooldown so the next frame call cannot hot-loop.
@@ -556,9 +578,15 @@ static void now_failed_ev(void *data, struct zwlr_screencopy_frame_v1 *f) {
     struct wr_wayland *w = data; (void)f; w->now_failed = true;
 }
 
-static void now_damage_ev(void *d, struct zwlr_screencopy_frame_v1 *f,
+static void now_damage_ev(void *data, struct zwlr_screencopy_frame_v1 *f,
                           uint32_t x, uint32_t y, uint32_t width, uint32_t height) {
-    (void)d; (void)f; (void)x; (void)y; (void)width; (void)height;
+    struct wr_wayland *w = data; (void)f;
+    if (w->now_damage_count < WR_MAX_DAMAGE) {
+        w->now_damage[w->now_damage_count++] =
+            (struct wr_rect){ (int32_t)x, (int32_t)y, (int32_t)width, (int32_t)height };
+    } else {
+        w->now_damage_overflowed = true;
+    }
 }
 
 static void now_dmabuf(void *d, struct zwlr_screencopy_frame_v1 *f,
@@ -576,10 +604,13 @@ static const struct zwlr_screencopy_frame_v1_listener now_listener = {
     .linux_dmabuf = now_dmabuf, .buffer_done = now_buffer_done,
 };
 
-const struct wr_frame *wr_capture_now(struct wr_wayland *w, int timeout_ms) {
+static const struct wr_frame *capture_screencopy(
+    struct wr_wayland *w, int timeout_ms, bool with_damage) {
     if (!w->screencopy || !w->output) return NULL;
 
     w->now_ready = w->now_failed = w->now_described = false;
+    w->now_damage_count = 0;
+    w->now_damage_overflowed = false;
 
     struct zwlr_screencopy_frame_v1 *frame =
         zwlr_screencopy_manager_v1_capture_output(w->screencopy, 0, w->output);
@@ -617,7 +648,10 @@ const struct wr_frame *wr_capture_now(struct wr_wayland *w, int timeout_ms) {
         w->now_have_buffer = true;
     }
 
-    zwlr_screencopy_frame_v1_copy(frame, w->now_buffer);
+    if (with_damage)
+        zwlr_screencopy_frame_v1_copy_with_damage(frame, w->now_buffer);
+    else
+        zwlr_screencopy_frame_v1_copy(frame, w->now_buffer);
 
     bool got = pump(w, &w->now_ready, &w->now_failed, timeout_ms);
     zwlr_screencopy_frame_v1_destroy(frame);
@@ -628,9 +662,18 @@ const struct wr_frame *wr_capture_now(struct wr_wayland *w, int timeout_ms) {
         .width = w->now_width, .height = w->now_height,
         .stride = w->now_stride, .format = w->now_format,
         .bytes_per_pixel = bytes_per_pixel(w->now_format),
-        .damage_count = 0, .damage_overflowed = true,   // treat as a full repaint
+        .damage_count = w->now_damage_count,
+        .damage_overflowed = with_damage ? w->now_damage_overflowed : true,
     };
+    if (with_damage && !w->now_damage_overflowed) {
+        memcpy(w->now_frame.damage, w->now_damage,
+               (size_t)w->now_damage_count * sizeof(w->now_damage[0]));
+    }
     return &w->now_frame;
+}
+
+const struct wr_frame *wr_capture_now(struct wr_wayland *w, int timeout_ms) {
+    return capture_screencopy(w, timeout_ms, false);
 }
 
 // --- input -----------------------------------------------------------------
