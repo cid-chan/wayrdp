@@ -54,6 +54,20 @@ $(BUILD)/wayrdp-probe: $(BUILD)/probe.o $(BUILD)/wayland.o $(PROTO_OBJS)
 $(BUILD)/wayrdp: $(BUILD)/main.o $(BUILD)/rdp.o $(BUILD)/config.o $(BUILD)/audio.o $(BUILD)/wayland.o $(PROTO_OBJS)
 	$(CC) $(CFLAGS) $(LDFLAGS) $^ $(LDLIBS) -o $@
 
+# The fixture runs its own compositor; it never captures the user's desktop.
+$(BUILD)/capture-test.o: tests/capture.c $(GEN)/wlr-screencopy-unstable-v1-server-protocol.h \
+    $(GEN)/ext-image-capture-source-v1-server-protocol.h $(GEN)/ext-image-copy-capture-v1-server-protocol.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(shell pkg-config --cflags wayland-server) -c $< -o $@
+
+$(BUILD)/capture-test: $(BUILD)/capture-test.o $(BUILD)/wayland.o $(PROTO_OBJS)
+	$(CC) $(CFLAGS) $(LDFLAGS) $^ $(LDLIBS) $(shell pkg-config --libs wayland-server) -o $@
+
+.PHONY: check-capture
+check-capture: $(BUILD)/capture-test
+	$(BUILD)/capture-test
+	$(BUILD)/capture-test --ext-only
+	$(BUILD)/capture-test --both
+
 $(GEN)/%-protocol.o: $(GEN)/%-protocol.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
@@ -61,6 +75,9 @@ define proto_rule
 $(GEN)/$(1)-client-protocol.h: $(2)
 	@mkdir -p $$(@D)
 	wayland-scanner client-header $$< $$@
+$(GEN)/$(1)-server-protocol.h: $(2)
+	@mkdir -p $$(@D)
+	wayland-scanner server-header $$< $$@
 $(GEN)/$(1)-protocol.c: $(2)
 	@mkdir -p $$(@D)
 	wayland-scanner private-code $$< $$@

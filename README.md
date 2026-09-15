@@ -58,8 +58,7 @@ The following are not implemented yet:
 - multiple monitors or output selection;
 - concurrent clients;
 - desktop scaling or a client-selected resolution;
-- per-window capture;
-- an automated test suite.
+- per-window capture.
 
 The first `wl_output` announced by the compositor is served at its native
 resolution. A second simultaneous connection is deliberately refused so that
@@ -506,7 +505,14 @@ installations.
 
 ## Development and verification
 
-There is no automated test suite yet. A practical verification sequence is:
+Run the capture regression tests with `make check-capture`. This target also
+requires the `wayland-server` development library. It starts a local test
+compositor and does not access the graphical session.
+
+The tests cover idle capture, buffer ownership, refresh, reconnect, output
+replacement, failure recovery, deadlines, and ext-only capture.
+
+For a live session, use this verification sequence:
 
 ```bash
 make clean
