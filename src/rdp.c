@@ -21,6 +21,7 @@
 #include <freerdp/constants.h>
 #include <freerdp/codec/color.h>
 #include <freerdp/codec/rfx.h>
+#include <freerdp/codec/nsc.h>
 #include <freerdp/crypto/certificate.h>
 #include <freerdp/crypto/privatekey.h>
 #include <freerdp/channels/audin.h>
@@ -39,6 +40,12 @@
 
 #include "audio.h"
 #include "rdp.h"
+
+enum wr_codec {
+    WR_CODEC_NONE,
+    WR_CODEC_NSC,
+    WR_CODEC_REMOTEFX,
+};
 
 struct wr_server {
     freerdp_listener *listener;
@@ -59,13 +66,14 @@ struct wr_server {
     volatile bool speaker_ready;   // set on the sound channel's own thread
     bool mic_tried;
 
-    // RemoteFX encodes from a 32-bit surface, so the compositor's 24-bit
-    // frames are kept mirrored in the shape the codec wants. Only damaged
-    // rectangles are refreshed into it, which is the whole point of damage.
+    // Frames are mirrored as BGRX32 once, then the negotiated codec reads
+    // only damaged rectangles from that buffer.
     uint8_t *mirror;
     size_t mirror_size;
     uint32_t mirror_width, mirror_height;
 
+    enum wr_codec codec;
+    NSC_CONTEXT *nsc;
     RFX_CONTEXT *rfx;
     wStream *stream;
 };
@@ -292,13 +300,64 @@ static bool clamp_rect(const struct wr_frame *f, int32_t *x, int32_t *y,
     return *width > 0 && *height > 0;
 }
 
-// Surface bits carrying a RemoteFX message.
-//
-// Raw pixels in a surface command (codec NONE) are legal on paper and refused
-// in practice: the first attempt sent them, the send failed, and the client
-// crashed. Clients negotiate a codec and RemoteFX is the one they all have.
+// NSCodec messages can grow beyond a single transport fragment when handed a
+// full 1080p frame. Tile them to a bounded working set; damage still determines
+// which tiles are encoded.
+#define NSC_TILE_SIZE 256
+
+static bool send_nsc_rect(struct wr_server *s, rdpUpdate *update,
+                          const RFX_RECT *rect) {
+    rdpSettings *settings = s->peer->context->settings;
+    uint32_t stride = s->mirror_width * 4;
+
+    for (uint32_t y = rect->y; y < (uint32_t)rect->y + rect->height;
+         y += NSC_TILE_SIZE) {
+        uint32_t height = (uint32_t)rect->y + rect->height - y;
+        if (height > NSC_TILE_SIZE) height = NSC_TILE_SIZE;
+
+        for (uint32_t x = rect->x; x < (uint32_t)rect->x + rect->width;
+             x += NSC_TILE_SIZE) {
+            uint32_t width = (uint32_t)rect->x + rect->width - x;
+            if (width > NSC_TILE_SIZE) width = NSC_TILE_SIZE;
+
+            Stream_SetPosition(s->stream, 0);
+            const uint8_t *pixels = s->mirror + (size_t)y * stride + (size_t)x * 4;
+            if (!nsc_compose_message(s->nsc, s->stream, pixels, width, height, stride))
+                return false;
+            size_t payload_size = Stream_GetPosition(s->stream);
+            uint32_t max_request = freerdp_settings_get_uint32(
+                settings, FreeRDP_MultifragMaxRequestSize);
+            if (max_request != 0 &&
+                (payload_size > max_request || max_request - payload_size < 1024)) {
+                fprintf(stderr,
+                        "wayrdp: NSCodec tile exceeds the client's update limit\n");
+                return false;
+            }
+
+            SURFACE_BITS_COMMAND cmd = { 0 };
+            cmd.cmdType = CMDTYPE_SET_SURFACE_BITS;
+            cmd.destLeft = x;
+            cmd.destTop = y;
+            cmd.destRight = x + width;
+            cmd.destBottom = y + height;
+            cmd.bmp.bpp = 32;
+            cmd.bmp.codecID = (UINT16)freerdp_settings_get_uint32(
+                settings, FreeRDP_NSCodecId);
+            cmd.bmp.width = (UINT16)width;
+            cmd.bmp.height = (UINT16)height;
+            cmd.bmp.bitmapDataLength = (UINT32)payload_size;
+            cmd.bmp.bitmapData = Stream_Buffer(s->stream);
+            cmd.skipCompression = TRUE;
+
+            if (!update->SurfaceBits(s->peer->context, &cmd))
+                return false;
+        }
+    }
+    return true;
+}
+
 static bool send_frame(struct wr_server *s, const struct wr_frame *f, bool full) {
-    if (!s->peer || !s->peer_activated || !s->rfx) return true;
+    if (!s->peer || !s->peer_activated || s->codec == WR_CODEC_NONE) return true;
 
     size_t needed = (size_t)f->width * f->height * 4;
     if (needed != s->mirror_size) {
@@ -308,17 +367,20 @@ static bool send_frame(struct wr_server *s, const struct wr_frame *f, bool full)
         s->mirror_size = needed;
         s->mirror_width = f->width;
         s->mirror_height = f->height;
-        full = true;    // a resized mirror holds nothing the client has seen
-        // The encoder is sized to the same resolution: a changed output needs a
-        // fresh context or rfx_compose_message refuses the frame.
-        if (!rfx_context_reset(s->rfx, f->width, f->height)) return false;
+        full = true;
+
+        if (s->codec == WR_CODEC_NSC) {
+            if (!nsc_context_reset(s->nsc, f->width, f->height)) return false;
+        } else {
+            if (!rfx_context_reset(s->rfx, f->width, f->height)) return false;
+        }
     }
 
     RFX_RECT rects[WR_MAX_DAMAGE];
     size_t count = 0;
 
     if (!full && !f->damage_overflowed && f->damage_count == 0)
-        return true;    // the frame carries no damage: nothing changed
+        return true;
     if (full || f->damage_overflowed) {
         mirror_rect(s, f, 0, 0, (int32_t)f->width, (int32_t)f->height);
         rects[count++] = (RFX_RECT){ 0, 0, (UINT16)f->width, (UINT16)f->height };
@@ -333,28 +395,40 @@ static bool send_frame(struct wr_server *s, const struct wr_frame *f, bool full)
         if (count == 0) return true;
     }
 
+    rdpUpdate *update = s->peer->context->update;
+    if (s->codec == WR_CODEC_NSC) {
+        if (!update->BeginPaint(s->peer->context)) return false;
+
+        bool sent = true;
+        for (size_t i = 0; i < count; i++) {
+            if (!send_nsc_rect(s, update, &rects[i])) {
+                sent = false;
+                break;
+            }
+        }
+        bool ended = update->EndPaint(s->peer->context);
+        return sent && ended;
+    }
+
     Stream_SetPosition(s->stream, 0);
     if (!rfx_compose_message(s->rfx, s->stream, rects, count, s->mirror,
                              f->width, f->height, (UINT32)f->width * 4))
         return false;
 
     rdpSettings *settings = s->peer->context->settings;
-
     SURFACE_BITS_COMMAND cmd = { 0 };
-    cmd.cmdType = CMDTYPE_SET_SURFACE_BITS;
-    cmd.destLeft = 0;
-    cmd.destTop = 0;
+    cmd.cmdType = CMDTYPE_STREAM_SURFACE_BITS;
     cmd.destRight = f->width;
     cmd.destBottom = f->height;
     cmd.bmp.bpp = 32;
-    cmd.bmp.codecID = (UINT16)freerdp_settings_get_uint32(settings, FreeRDP_RemoteFxCodecId);
+    cmd.bmp.codecID = (UINT16)freerdp_settings_get_uint32(
+        settings, FreeRDP_RemoteFxCodecId);
     cmd.bmp.width = (UINT16)f->width;
     cmd.bmp.height = (UINT16)f->height;
     cmd.bmp.bitmapDataLength = (UINT32)Stream_GetPosition(s->stream);
     cmd.bmp.bitmapData = Stream_Buffer(s->stream);
     cmd.skipCompression = TRUE;
 
-    rdpUpdate *update = s->peer->context->update;
     if (!update->BeginPaint(s->peer->context)) return false;
     if (!update->SurfaceBits(s->peer->context, &cmd)) return false;
     return update->EndPaint(s->peer->context);
@@ -685,16 +759,11 @@ static void close_audio(struct wr_server *s) {
 static BOOL peer_capabilities(freerdp_peer *peer) {
     rdpSettings *settings = peer->context->settings;
 
-    // Without these there is nowhere to put the pixels on this path, and a
-    // client told plainly beats a client showing a white window.
     if (!freerdp_settings_get_bool(settings, FreeRDP_SurfaceCommandsEnabled)) {
         fprintf(stderr, "wayrdp: client does not support surface commands; refused\n");
         return FALSE;
     }
-    if (!freerdp_settings_get_bool(settings, FreeRDP_RemoteFxCodec)) {
-        fprintf(stderr, "wayrdp: client does not offer RemoteFX; refused\n");
-        return FALSE;
-    }
+
     return TRUE;
 }
 
@@ -742,18 +811,65 @@ static BOOL peer_post_connect(freerdp_peer *peer) {
 static BOOL peer_activate(freerdp_peer *peer) {
     wrPeerContext *ctx = (wrPeerContext *)peer->context;
     struct wr_server *s = ctx->server;
+    rdpSettings *settings = peer->context->settings;
+
+    uint32_t surface_commands = freerdp_settings_get_uint32(
+        settings, FreeRDP_SurfaceCommandsSupported);
+    uint32_t rfx_id = freerdp_settings_get_uint32(
+        settings, FreeRDP_RemoteFxCodecId);
+    uint32_t nsc_id = freerdp_settings_get_uint32(
+        settings, FreeRDP_NSCodecId);
+    bool has_rfx = (surface_commands & SURFCMDS_STREAM_SURFACE_BITS) &&
+                   freerdp_settings_get_bool(settings, FreeRDP_RemoteFxCodec) &&
+                   rfx_id != 0;
+    bool has_nsc = (surface_commands & SURFCMDS_SET_SURFACE_BITS) &&
+                   freerdp_settings_get_bool(settings, FreeRDP_NSCodec) &&
+                   nsc_id != 0;
+
+    if (has_rfx)
+        s->codec = WR_CODEC_REMOTEFX;
+    else if (has_nsc)
+        s->codec = WR_CODEC_NSC;
+    else {
+        fprintf(stderr,
+                "wayrdp: client offers neither usable RemoteFX nor NSCodec; refused\n");
+        return FALSE;
+    }
+
+    fprintf(stderr, "wayrdp: selected %s for %s\n",
+            s->codec == WR_CODEC_REMOTEFX ? "RemoteFX" : "NSCodec",
+            peer->hostname);
 
     uint32_t width = wr_width(s->wayland), height = wr_height(s->wayland);
-    if (!s->rfx) {
-        s->rfx = rfx_context_new_ex(TRUE, THREADING_FLAGS_DISABLE_THREADS);
+    if (!s->stream)
         s->stream = Stream_New(NULL, 4 * 1024 * 1024);
-        if (!s->rfx || !s->stream) {
+    if (!s->stream) return FALSE;
+
+    if (s->codec == WR_CODEC_NSC) {
+        if (!s->nsc) s->nsc = nsc_context_new();
+        if (!s->nsc ||
+            !nsc_context_set_parameters(s->nsc, NSC_COLOR_LOSS_LEVEL,
+                freerdp_settings_get_uint32(settings, FreeRDP_NSCodecColorLossLevel)) ||
+            !nsc_context_set_parameters(s->nsc, NSC_ALLOW_SUBSAMPLING,
+                freerdp_settings_get_bool(settings, FreeRDP_NSCodecAllowSubsampling)) ||
+            !nsc_context_set_parameters(s->nsc, NSC_DYNAMIC_COLOR_FIDELITY,
+                !freerdp_settings_get_bool(
+                    settings, FreeRDP_NSCodecAllowDynamicColorFidelity)) ||
+            !nsc_context_set_parameters(s->nsc, NSC_COLOR_FORMAT, PIXEL_FORMAT_BGRX32) ||
+            !nsc_context_reset(s->nsc, width, height)) {
+            fprintf(stderr, "wayrdp: could not create the NSCodec encoder\n");
+            return FALSE;
+        }
+    } else {
+        if (!s->rfx)
+            s->rfx = rfx_context_new_ex(TRUE, THREADING_FLAGS_DISABLE_THREADS);
+        if (!s->rfx) {
             fprintf(stderr, "wayrdp: could not create the RemoteFX encoder\n");
             return FALSE;
         }
         rfx_context_set_pixel_format(s->rfx, PIXEL_FORMAT_BGRX32);
+        if (!rfx_context_reset(s->rfx, width, height)) return FALSE;
     }
-    if (!rfx_context_reset(s->rfx, width, height)) return FALSE;
 
     s->peer_activated = true;
     fprintf(stderr, "wayrdp: %s connected, serving %ux%u\n",
@@ -827,6 +943,7 @@ static BOOL peer_accepted(freerdp_listener *listener, freerdp_peer *peer) {
         !freerdp_settings_set_bool(settings, FreeRDP_NlaSecurity, FALSE) ||
         !freerdp_settings_set_uint32(settings, FreeRDP_ColorDepth, 32) ||
         !freerdp_settings_set_bool(settings, FreeRDP_SurfaceCommandsEnabled, TRUE) ||
+        !freerdp_settings_set_bool(settings, FreeRDP_NSCodec, TRUE) ||
         !freerdp_settings_set_bool(settings, FreeRDP_RemoteFxCodec, TRUE) ||
         !freerdp_settings_set_bool(settings, FreeRDP_UnicodeInput, TRUE) ||
         // The microphone is a dynamic channel, and a server that does not
@@ -991,6 +1108,7 @@ void wr_server_free(struct wr_server *s) {
     }
     if (s->stream) Stream_Free(s->stream, TRUE);
     if (s->rfx) rfx_context_free(s->rfx);
+    if (s->nsc) nsc_context_free(s->nsc);
     free(s->mirror);
     free(s);
 }

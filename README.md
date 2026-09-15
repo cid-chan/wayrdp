@@ -5,7 +5,7 @@ shares the desktop session that is already running: an RDP client sees the same
 screen as the local user and can control it with a remote keyboard and pointer.
 
 The server uses standard Wayland and wlroots protocols for capture and input,
-FreeRDP 3 for the RDP transport and RemoteFX encoding, and PipeWire for
+FreeRDP 3 for the RDP transport and video codecs, and PipeWire for
 bidirectional audio. It is not tied to a particular desktop shell.
 
 > [!IMPORTANT]
@@ -40,7 +40,7 @@ The core remote-desktop path is implemented and usable:
 - capture of the existing Wayland output;
 - damage-based incremental screen updates;
 - an immediate full capture when a client first connects;
-- RemoteFX encoding through FreeRDP 3;
+- RemoteFX encoding with an NSCodec fallback through FreeRDP 3;
 - pointer movement, three mouse buttons and vertical scrolling;
 - keyboard input, modifiers, lock keys and compositor shortcuts;
 - keyboard-layout discovery through XKB environment variables or
@@ -72,7 +72,7 @@ flowchart LR
     subgraph Host[Wayland host session]
         Compositor[wlroots compositor]
         Bridge[Wayland capture and input bridge]
-        Server[FreeRDP server and RemoteFX encoder]
+        Server[FreeRDP server and video encoder]
         Audio[PipeWire audio bridge]
     end
 
@@ -96,8 +96,8 @@ the client does not have to wait for something on screen to change.
 
 Frames arrive in a Wayland shared-memory buffer. Supported 24-bit and 32-bit
 pixel formats are converted into a persistent BGRX32 mirror, but only inside
-the damaged rectangles. FreeRDP then encodes those rectangles as RemoteFX
-surface commands.
+the damaged rectangles. FreeRDP encodes those rectangles as RemoteFX or
+NSCodec surface commands.
 
 RDP set-1 keyboard scancodes are translated to Linux evdev key codes. Extended
 keys are mapped explicitly, and modifier state is sent separately because the
@@ -110,6 +110,10 @@ default WinPR thread pool spawns one worker per available CPU and, measured on a
 1080p output, contends badly enough that turning it off dropped the server's CPU
 roughly four times for the same frame rate. A single encoder thread is both
 cheaper and no slower here.
+
+The server uses NSCodec only when the client does not offer RemoteFX. NSCodec
+messages are split into 256-pixel tiles and checked against the client's update
+limit before transmission.
 
 The pixel repack into the BGRX32 mirror is likewise format-specialised: the
 compositor offers a single pixel format for the whole session, so the byte order
@@ -125,7 +129,7 @@ re-tested for every pixel.
 | Initial full frame | `wlr-screencopy-unstable-v1` | Captures the current output immediately after activation |
 | Remote pointer | `wlr-virtual-pointer-unstable-v1` | Injects absolute movement, buttons and scrolling |
 | Remote keyboard | `virtual-keyboard-unstable-v1` | Injects evdev keys, modifiers and an XKB keymap |
-| RDP server | FreeRDP 3 and WinPR | Listener, TLS, authentication, input, channels and RemoteFX |
+| RDP server | FreeRDP 3 and WinPR | Listener, TLS, authentication, input, channels and video codecs |
 | Audio | PipeWire 0.3 | Captures the default sink and publishes a remote microphone |
 
 The Makefile also generates bindings for `ext-foreign-toplevel-list-v1`, but
@@ -153,8 +157,8 @@ On Wayfire, the `copy-capture` plugin must be present in `core/plugins` for the
 ext-image-copy-capture interfaces to be available. Other wlroots compositors
 can work if they expose the same protocols and allow the client to use them.
 
-The RDP client must support surface commands and RemoteFX. Clients that do not
-negotiate both are rejected rather than being left with a blank window.
+The RDP client must support surface commands and either RemoteFX or NSCodec.
+Clients that negotiate neither codec are rejected before frame transmission.
 
 ### Build dependencies
 
@@ -443,7 +447,7 @@ Common failures:
 | No frame from `wayrdp-probe` | Wake the output and cause visible screen damage before the timeout |
 | `could not bind the port` | Check the bind address, firewall and whether another process owns the port |
 | Certificate generation failure | Install `openssl` and check access to `~/.local/share/wayrdp` |
-| Client is refused before showing a desktop | Use a client that negotiates surface commands and RemoteFX |
+| Client is refused before showing a desktop | Use a client that negotiates surface commands and either RemoteFX or NSCodec |
 | Silent or distorted audio | Enable `WAYRDP_DEBUG_AUDIO`, then inspect the selected client format and byte/peak counters |
 | Wrong keyboard characters | Set the correct XKB layout or update the system keyboard configuration |
 
@@ -480,7 +484,7 @@ Do not expose the server directly to the public internet in its current form.
     ├── main.c       Process lifecycle, readiness check and signal handling
     ├── config.c     Config parsing, validation and TLS certificate creation
     ├── wayland.c    Output capture, shared memory and virtual input
-    ├── rdp.c        FreeRDP listener, authentication, RemoteFX and channels
+    ├── rdp.c        FreeRDP listener, authentication, video codecs and channels
     ├── audio.c      PipeWire streams and synchronized ring buffers
     └── probe.c      Standalone Wayland capability test
 ```
@@ -509,7 +513,7 @@ build/wayrdp --check
 build/wayrdp-probe frame.ppm
 ```
 
-Then connect with a RemoteFX-capable RDP client and verify initial paint,
+Then connect with RemoteFX and NSCodec clients and verify initial paint,
 incremental updates, pointer buttons and scrolling, normal keys and shortcuts,
 speaker audio, microphone publication, disconnect and reconnect.
 
