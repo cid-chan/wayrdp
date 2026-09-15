@@ -759,11 +759,16 @@ static BOOL peer_activate(freerdp_peer *peer) {
     fprintf(stderr, "wayrdp: %s connected, serving %ux%u\n",
             peer->hostname, width, height);
 
-    // The client has an empty window and nothing is going to change on a still
-    // desktop, so the first paint has to be asked for rather than waited for.
-    const struct wr_frame *f = wr_capture_now(s->wayland, 2000);
-    if (f && !send_frame(s, f, true))
-        fprintf(stderr, "wayrdp: could not send the first frame\n");
+    // Queue the first paint without holding up the RDP event loop.
+    wr_capture_refresh(s->wayland);
+    return TRUE;
+}
+
+static BOOL peer_refresh_rect(rdpContext *context, BYTE count, const RECTANGLE_16 *areas) {
+    wrPeerContext *ctx = (wrPeerContext *)context;
+    (void)areas;
+    if (count && ctx->server->peer_activated)
+        wr_capture_refresh(ctx->server->wayland);
     return TRUE;
 }
 
@@ -844,6 +849,7 @@ static BOOL peer_accepted(freerdp_listener *listener, freerdp_peer *peer) {
 
     peer->context->input->KeyboardEvent = peer_keyboard;
     peer->context->input->MouseEvent = peer_mouse;
+    peer->context->update->RefreshRect = peer_refresh_rect;
 
     s->peer = peer;
     s->peer_activated = false;
@@ -854,6 +860,7 @@ static BOOL peer_accepted(freerdp_listener *listener, freerdp_peer *peer) {
 static void drop_peer(struct wr_server *s) {
     if (!s->peer) return;
     fprintf(stderr, "wayrdp: %s disconnected\n", s->peer->hostname);
+    wr_capture_cancel(s->wayland);
 
     // Channels first: they hold threads that are reading from a transport this
     // is about to close, and the microphone should disappear from the desktop's
@@ -971,7 +978,8 @@ bool wr_server_run(struct wr_server *s, const volatile bool *running) {
             open_microphone(s);
             pump_speaker(s);
 
-            // The wait is the frame pacing: this is the loop's idle time.
+            // Screencopy returns immediately while its request is pending.
+            // The next call occurs only after send_frame has consumed the buffer.
             const struct wr_frame *f = wr_capture_frame(s->wayland, 16);
             if (f && !send_frame(s, f, false))
                 drop_peer(s);

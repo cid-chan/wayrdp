@@ -65,17 +65,19 @@ struct wr_wayland {
     bool frame_ready, frame_failed;
     uint32_t fail_reason;
 
-    // The on-demand path owns its own buffer: screencopy names its own format
-    // and stride, and they need not match what the capture session chose.
     // Modifier state, tracked here because nothing else does it.
     uint32_t mods_depressed, mods_locked;
 
+    // Screencopy owns one request and one reusable buffer. A completed buffer
+    // stays untouched until the caller asks for another frame after encoding.
+    struct zwlr_screencopy_frame_v1 *now_capture;
     struct wl_buffer *now_buffer;
     void *now_pixels;
     size_t now_size, now_stride;
     uint32_t now_format, now_width, now_height;
     struct wr_frame now_frame;
-    bool now_have_buffer, now_ready, now_failed, now_described;
+    bool now_ready, now_failed, now_described, now_with_damage, now_full_next;
+    int64_t now_deadline_ms, now_retry_at_ms;
     struct wr_rect now_damage[WR_MAX_DAMAGE];
     int now_damage_count;
     bool now_damage_overflowed;
@@ -135,13 +137,20 @@ static int anonymous_shm(size_t size) {
 // Dispatch until a flag flips or the deadline passes. Returns false on timeout.
 static bool pump(struct wr_wayland *w, const bool *a, const bool *b, int timeout_ms) {
     struct pollfd pfd = { .fd = wl_display_get_fd(w->display), .events = POLLIN };
+    const int64_t deadline = now_ms() + timeout_ms;
 
     while (!*a && (!b || !*b)) {
-        while (wl_display_prepare_read(w->display) != 0)
-            wl_display_dispatch_pending(w->display);
+        while (wl_display_prepare_read(w->display) != 0) {
+            if (wl_display_dispatch_pending(w->display) < 0) return false;
+            if (*a || (b && *b)) return true;
+            if (now_ms() >= deadline) return false;
+        }
         wl_display_flush(w->display);
 
-        int n = poll(&pfd, 1, timeout_ms);
+        int64_t remaining = deadline - now_ms();
+        if (remaining <= 0) { wl_display_cancel_read(w->display); return false; }
+        int n = poll(&pfd, 1, (int)remaining);
+        if (n < 0 && errno == EINTR) { wl_display_cancel_read(w->display); continue; }
         if (n <= 0) { wl_display_cancel_read(w->display); return false; }
 
         if (wl_display_read_events(w->display) < 0) return false;
@@ -411,6 +420,7 @@ uint32_t wr_height(const struct wr_wayland *w) { return w->height; }
 // Release everything a capture owns. Safe to call when nothing was opened, and
 // used both on a normal close and when the compositor drops the output.
 static void capture_teardown(struct wr_wayland *w) {
+    wr_capture_cancel(w);
     if (w->pixels) { munmap(w->pixels, w->size); w->pixels = NULL; }
     if (w->buffer) { wl_buffer_destroy(w->buffer); w->buffer = NULL; }
     if (w->session) {
@@ -517,12 +527,12 @@ static bool capture_reopen(struct wr_wayland *w) {
     return true;
 }
 
-static const struct wr_frame *capture_screencopy(
-    struct wr_wayland *w, int timeout_ms, bool with_damage);
+static const struct wr_frame *capture_screencopy(struct wr_wayland *w);
 
 const struct wr_frame *wr_capture_frame(struct wr_wayland *w, int timeout_ms) {
-    if (w->use_screencopy)
-        return capture_screencopy(w, timeout_ms, true);
+    if (w->use_screencopy || w->now_capture ||
+        (w->now_full_next && w->screencopy))
+        return capture_screencopy(w);
     // A stopped session or a replaced output leaves the old capture dead. Rebuild
     // it here instead of polling a session that will never answer again. A failed
     // rebuild sets a short cooldown so the next frame call cannot hot-loop.
@@ -571,7 +581,10 @@ static void now_flags(void *d, struct zwlr_screencopy_frame_v1 *f, uint32_t flag
 static void now_ready_ev(void *data, struct zwlr_screencopy_frame_v1 *f,
                          uint32_t hi, uint32_t lo, uint32_t nsec) {
     struct wr_wayland *w = data; (void)f; (void)hi; (void)lo; (void)nsec;
-    w->now_ready = true;
+    if (w->now_deadline_ms && now_ms() >= w->now_deadline_ms)
+        w->now_failed = true;
+    else
+        w->now_ready = true;
 }
 
 static void now_failed_ev(void *data, struct zwlr_screencopy_frame_v1 *f) {
@@ -594,8 +607,53 @@ static void now_dmabuf(void *d, struct zwlr_screencopy_frame_v1 *f,
     (void)d; (void)f; (void)format; (void)width; (void)height;
 }
 
-static void now_buffer_done(void *d, struct zwlr_screencopy_frame_v1 *f) {
-    (void)d; (void)f;
+static void now_buffer_done(void *data, struct zwlr_screencopy_frame_v1 *f) {
+    struct wr_wayland *w = data;
+    if (!w->now_described || now_ms() >= w->now_deadline_ms) {
+        w->now_failed = true;
+        return;
+    }
+
+    size_t needed = w->now_stride * w->now_height;
+    if (!w->now_buffer || w->now_frame.width != w->now_width ||
+        w->now_frame.height != w->now_height ||
+        w->now_frame.stride != w->now_stride ||
+        w->now_frame.format != w->now_format) {
+        if (w->now_pixels) { munmap(w->now_pixels, w->now_size); w->now_pixels = NULL; }
+        if (w->now_buffer) { wl_buffer_destroy(w->now_buffer); w->now_buffer = NULL; }
+        w->now_frame.pixels = NULL;
+
+        int fd = anonymous_shm(needed);
+        if (fd < 0) { w->now_failed = true; return; }
+        w->now_pixels = mmap(NULL, needed, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (w->now_pixels == MAP_FAILED) {
+            close(fd); w->now_pixels = NULL; w->now_failed = true;
+            return;
+        }
+
+        struct wl_shm_pool *pool = wl_shm_create_pool(w->shm, fd, (int32_t)needed);
+        w->now_buffer = wl_shm_pool_create_buffer(pool, 0, (int32_t)w->now_width,
+            (int32_t)w->now_height, (int32_t)w->now_stride, w->now_format);
+        wl_shm_pool_destroy(pool);
+        close(fd);
+        w->now_size = needed;
+        // A new buffer or output geometry needs a full repaint.
+        w->now_with_damage = false;
+    }
+
+    w->now_frame = (struct wr_frame){
+        .pixels = w->now_pixels,
+        .width = w->now_width, .height = w->now_height,
+        .stride = w->now_stride, .format = w->now_format,
+        .bytes_per_pixel = bytes_per_pixel(w->now_format),
+    };
+    if (w->now_with_damage) {
+        zwlr_screencopy_frame_v1_copy_with_damage(f, w->now_buffer);
+        // An idle screen is not a capture failure. Keep this request pending.
+        w->now_deadline_ms = 0;
+    } else {
+        zwlr_screencopy_frame_v1_copy(f, w->now_buffer);
+    }
 }
 
 static const struct zwlr_screencopy_frame_v1_listener now_listener = {
@@ -604,76 +662,84 @@ static const struct zwlr_screencopy_frame_v1_listener now_listener = {
     .linux_dmabuf = now_dmabuf, .buffer_done = now_buffer_done,
 };
 
-static const struct wr_frame *capture_screencopy(
-    struct wr_wayland *w, int timeout_ms, bool with_damage) {
-    if (!w->screencopy || !w->output) return NULL;
+void wr_capture_cancel(struct wr_wayland *w) {
+    if (w->now_capture) {
+        zwlr_screencopy_frame_v1_destroy(w->now_capture);
+        w->now_capture = NULL;
+    }
+    // The compositor may still hold a canceled copy's buffer. Do not reuse
+    // that storage for another request.
+    if (w->now_buffer) { wl_buffer_destroy(w->now_buffer); w->now_buffer = NULL; }
+    if (w->now_pixels) { munmap(w->now_pixels, w->now_size); w->now_pixels = NULL; }
+    w->now_frame.pixels = NULL;
+    w->now_size = 0;
+    w->now_ready = false;
+    w->now_failed = true; // Also wake a synchronous startup capture on removal.
+    w->now_full_next = true;
+    w->now_deadline_ms = w->now_retry_at_ms = 0;
+}
+
+static void start_screencopy(struct wr_wayland *w) {
+    if (!w->screencopy || !w->output || now_ms() < w->now_retry_at_ms) return;
 
     w->now_ready = w->now_failed = w->now_described = false;
     w->now_damage_count = 0;
     w->now_damage_overflowed = false;
-
-    struct zwlr_screencopy_frame_v1 *frame =
+    w->now_with_damage = !w->now_full_next;
+    w->now_deadline_ms = now_ms() + 5000;
+    w->now_capture =
         zwlr_screencopy_manager_v1_capture_output(w->screencopy, 0, w->output);
-    zwlr_screencopy_frame_v1_add_listener(frame, &now_listener, w);
+    zwlr_screencopy_frame_v1_add_listener(w->now_capture, &now_listener, w);
+}
 
-    // The buffer parameters arrive first and the copy cannot be asked for
-    // before they do.
-    if (!pump(w, &w->now_described, &w->now_failed, timeout_ms) || w->now_failed) {
-        zwlr_screencopy_frame_v1_destroy(frame);
+void wr_capture_refresh(struct wr_wayland *w) {
+    wr_capture_cancel(w);
+    start_screencopy(w);
+}
+
+static const struct wr_frame *capture_screencopy(struct wr_wayland *w) {
+    if (!w->now_capture) {
+        start_screencopy(w);
         return NULL;
     }
-
-    size_t needed = w->now_stride * w->now_height;
-    if (!w->now_have_buffer || needed != w->now_size) {
-        if (w->now_pixels) munmap(w->now_pixels, w->now_size);
-        if (w->now_buffer) wl_buffer_destroy(w->now_buffer);
-
-        int fd = anonymous_shm(needed);
-        if (fd < 0) { zwlr_screencopy_frame_v1_destroy(frame); return NULL; }
-
-        w->now_pixels = mmap(NULL, needed, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-        if (w->now_pixels == MAP_FAILED) {
-            close(fd); w->now_pixels = NULL;
-            zwlr_screencopy_frame_v1_destroy(frame);
-            return NULL;
-        }
-
-        struct wl_shm_pool *pool = wl_shm_create_pool(w->shm, fd, (int32_t)needed);
-        w->now_buffer = wl_shm_pool_create_buffer(pool, 0, (int32_t)w->now_width,
-            (int32_t)w->now_height, (int32_t)w->now_stride, w->now_format);
-        wl_shm_pool_destroy(pool);
-        close(fd);
-
-        w->now_size = needed;
-        w->now_have_buffer = true;
+    if (w->now_failed || (!w->now_ready && w->now_deadline_ms &&
+                         now_ms() >= w->now_deadline_ms)) {
+        fprintf(stderr, "wayrdp: screencopy failed; retrying in 500ms\n");
+        wr_capture_cancel(w);
+        // A failed optional refresh must not starve a healthy ext session.
+        w->now_full_next = w->use_screencopy;
+        w->now_retry_at_ms = now_ms() + 500;
+        return NULL;
     }
+    if (!w->now_ready) return NULL;
 
-    if (with_damage)
-        zwlr_screencopy_frame_v1_copy_with_damage(frame, w->now_buffer);
-    else
-        zwlr_screencopy_frame_v1_copy(frame, w->now_buffer);
-
-    bool got = pump(w, &w->now_ready, &w->now_failed, timeout_ms);
-    zwlr_screencopy_frame_v1_destroy(frame);
-    if (!got || w->now_failed) return NULL;
-
-    w->now_frame = (struct wr_frame){
-        .pixels = w->now_pixels,
-        .width = w->now_width, .height = w->now_height,
-        .stride = w->now_stride, .format = w->now_format,
-        .bytes_per_pixel = bytes_per_pixel(w->now_format),
-        .damage_count = w->now_damage_count,
-        .damage_overflowed = with_damage ? w->now_damage_overflowed : true,
-    };
-    if (with_damage && !w->now_damage_overflowed) {
+    zwlr_screencopy_frame_v1_destroy(w->now_capture);
+    w->now_capture = NULL;
+    w->now_ready = false;
+    w->now_full_next = false;
+    w->now_frame.damage_count = w->now_damage_count;
+    w->now_frame.damage_overflowed = !w->now_with_damage || w->now_damage_overflowed;
+    if (w->now_with_damage && !w->now_damage_overflowed) {
         memcpy(w->now_frame.damage, w->now_damage,
                (size_t)w->now_damage_count * sizeof(w->now_damage[0]));
     }
+    if (w->use_screencopy) {
+        w->width = w->now_width;
+        w->height = w->now_height;
+    }
+    // Do not queue another copy here: send_frame still needs these pixels.
     return &w->now_frame;
 }
 
 const struct wr_frame *wr_capture_now(struct wr_wayland *w, int timeout_ms) {
-    return capture_screencopy(w, timeout_ms, false);
+    if (!w->screencopy) return wr_capture_frame(w, timeout_ms);
+    wr_capture_refresh(w);
+    if (!w->now_capture) return NULL;
+    if (!pump(w, &w->now_ready, &w->now_failed, timeout_ms)) {
+        wr_capture_cancel(w);
+        return NULL;
+    }
+    return capture_screencopy(w);
 }
 
 // --- input -----------------------------------------------------------------

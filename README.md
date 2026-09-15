@@ -94,6 +94,13 @@ screen damage. An idle desktop therefore produces no video traffic. When a new
 client activates, the screencopy path requests a complete frame immediately so
 the client does not have to wait for something on screen to change.
 
+When the ext capture interfaces are unavailable, wayrdp uses `wlr-screencopy`,
+including on niri. One capture request stays pending while the existing event
+loop processes RDP input and Wayland events. Capture adds no thread and does
+not wait inside the RDP loop. The next copy starts after the encoder consumes
+the previous frame. Client activation and refresh requests queue a full frame.
+The ext capture path remains synchronous.
+
 Frames arrive in a Wayland shared-memory buffer. Supported 24-bit and 32-bit
 pixel formats are converted into a persistent BGRX32 mirror, but only inside
 the damaged rectangles. FreeRDP then encodes those rectangles as RemoteFX
@@ -122,7 +129,7 @@ re-tested for every pixel.
 | --- | --- | --- |
 | Incremental capture | `ext-image-copy-capture-v1` | Captures frames and reports damage regions |
 | Output capture source | `ext-image-capture-source-v1` | Selects a compositor output as the capture source |
-| Initial full frame | `wlr-screencopy-unstable-v1` | Captures the current output immediately after activation |
+| Full frame and fallback streaming | `wlr-screencopy-unstable-v1` version 3 | Captures immediately or waits asynchronously for damage |
 | Remote pointer | `wlr-virtual-pointer-unstable-v1` | Injects absolute movement, buttons and scrolling |
 | Remote keyboard | `virtual-keyboard-unstable-v1` | Injects evdev keys, modifiers and an XKB keymap |
 | RDP server | FreeRDP 3 and WinPR | Listener, TLS, authentication, input, channels and RemoteFX |
@@ -140,14 +147,14 @@ work.
 desktop being shared. Core startup requires the compositor to advertise:
 
 - `wl_shm`, `wl_seat` and at least one `wl_output`;
-- `ext_output_image_capture_source_manager_v1`;
-- `ext_image_copy_capture_manager_v1`;
 - `zwlr_virtual_pointer_manager_v1`;
 - `zwp_virtual_keyboard_manager_v1`.
 
-`zwlr_screencopy_manager_v1` is also expected for the immediate full frame on
-client activation. Without it, the server can start, but the initial desktop
-paint is unavailable until the incremental capture path receives new damage.
+Capture requires either both `ext_output_image_capture_source_manager_v1` and
+`ext_image_copy_capture_manager_v1`, or `zwlr_screencopy_manager_v1` version 3.
+The ext interfaces take precedence when both paths are available. Screencopy
+also supplies full frames on activation and refresh. Without it, initial paint
+uses the ext capture path.
 
 On Wayfire, the `copy-capture` plugin must be present in `core/plugins` for the
 ext-image-copy-capture interfaces to be available. Other wlroots compositors
@@ -438,7 +445,7 @@ Common failures:
 | Message or symptom | What to check |
 | --- | --- |
 | `no Wayland display` | Run as the desktop user and verify `XDG_RUNTIME_DIR` and `WAYLAND_DISPLAY` |
-| `compositor does not offer ext-image-copy-capture` | Enable the compositor's capture support; on Wayfire, add `copy-capture` to `core/plugins` |
+| `compositor offers neither ext-image-copy-capture nor wlr-screencopy` | Enable a supported capture protocol; on Wayfire, add `copy-capture` to `core/plugins` |
 | Missing virtual pointer or keyboard | Confirm the compositor exposes and authorizes the wlroots input protocols |
 | No frame from `wayrdp-probe` | Wake the output and cause visible screen damage before the timeout |
 | `could not bind the port` | Check the bind address, firewall and whether another process owns the port |

@@ -64,19 +64,21 @@ bool wr_capture_open(struct wr_wayland *w, const char **error);
 uint32_t wr_width(const struct wr_wayland *w);
 uint32_t wr_height(const struct wr_wayland *w);
 
-// Grab the screen as it is, now.
-//
-// The streaming path answers only when something changes, which is the right
-// default and useless for the first paint: a client that has just connected has
-// an empty window and no damage is coming. This copies on demand instead, and
-// is also the answer to a client asking for a refresh.
+// Synchronous capture for startup and the probe, not the RDP event loop.
+// Screencopy requests a full frame; without it, wait for an ext capture frame.
 const struct wr_frame *wr_capture_now(struct wr_wayland *w, int timeout_ms);
 
-// Wait for one frame, up to timeout_ms.
-//
-// Returns NULL on timeout, which is not an error: the compositor answers a
-// capture request when the screen changes, so an idle desktop produces nothing
-// and that is exactly the bandwidth a remote desktop should use.
+// Queue a full screencopy frame without waiting. Replaces any pending capture.
+// Used for client activation and refresh requests.
+void wr_capture_refresh(struct wr_wayland *w);
+
+// Cancel screencopy and discard its buffer on disconnect or output removal.
+void wr_capture_cancel(struct wr_wayland *w);
+
+// With screencopy, start or collect a frame without waiting. Dispatch Wayland
+// events between calls; NULL means that capture is pending or unavailable.
+// The ext-image-copy path still waits up to timeout_ms.
+// Consume the returned pixels before the next capture call or event dispatch.
 const struct wr_frame *wr_capture_frame(struct wr_wayland *w, int timeout_ms);
 
 // --- input -----------------------------------------------------------------

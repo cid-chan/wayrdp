@@ -52,16 +52,13 @@ int main(int argc, char **argv) {
     if (!wr_input_open(w, &error)) { fprintf(stderr, "wayrdp: %s\n", error); return 1; }
     printf("input:   virtual pointer and keyboard created\n");
 
-    // Move first, then capture: a still screen answers a capture request with
-    // silence, so the motion is both the test and the damage that produces a
-    // frame at all.
+    // Exercise pointer input, then request a full frame even on a still screen.
     wr_pointer_motion(w, wr_width(w) / 2, wr_height(w) / 2);
     wr_pointer_motion(w, wr_width(w) / 2 + 40, wr_height(w) / 2 + 40);
 
-    const struct wr_frame *f = wr_capture_frame(w, 5000);
+    const struct wr_frame *f = wr_capture_now(w, 5000);
     if (!f) {
-        fprintf(stderr, "wayrdp: no frame in 5s. Nothing on screen changed, which is "
-                        "the protocol working -- or the output is asleep.\n");
+        fprintf(stderr, "wayrdp: no frame in 5s; the output may be asleep.\n");
         return 2;
     }
 
