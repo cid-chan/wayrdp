@@ -224,20 +224,61 @@ static BOOL peer_logon(freerdp_peer *peer, const SEC_WINNT_AUTH_IDENTITY *identi
 // The compositor hands over BG24 and RemoteFX wants BGRX32, so the conversion
 // has to happen somewhere. Doing it per damaged rectangle rather than per frame
 // is what keeps a blinking cursor from costing a full-screen repack.
+//
+// The format is chosen once per rectangle and the byte order is resolved by a
+// tight loop: the compositor offers a single format for the whole session, so
+// this runs millions of times per frame and must not re-decide per pixel. The
+// old version called wr_read_rgb -- a function in another translation unit, so
+// never inlined -- for every pixel, with a switch inside it.
 static void mirror_rect(struct wr_server *s, const struct wr_frame *f,
                         int32_t x, int32_t y, int32_t width, int32_t height) {
+    const int bpp = f->bytes_per_pixel;
+    const size_t src_stride = f->stride;
+    const size_t dst_stride = (size_t)f->width * 4;
+
+    // On the wire BGR888/XRGB8888/ARGB8888 are already B,G,R in memory, which
+    // is what RemoteFX wants; those copy straight across. XBGR/ABGR8888 are
+    // R,G,B and need the red and blue halves exchanged.
+    const bool mem_bgr = wr_format_is_bgr(f->format);
+
     for (int32_t row = 0; row < height; row++) {
-        const uint8_t *src = f->pixels + (size_t)(y + row) * f->stride
-                           + (size_t)x * f->bytes_per_pixel;
-        uint8_t *dst = s->mirror + (size_t)(y + row) * (size_t)f->width * 4
+        const uint8_t *src = f->pixels + (size_t)(y + row) * src_stride
+                           + (size_t)x * (size_t)bpp;
+        uint8_t *dst = s->mirror + (size_t)(y + row) * dst_stride
                      + (size_t)x * 4;
-        for (int32_t col = 0; col < width; col++) {
-            uint8_t rgb[3];
-            wr_read_rgb(src + (size_t)col * f->bytes_per_pixel, f->format, rgb);
-            dst[col * 4 + 0] = rgb[2];   // B
-            dst[col * 4 + 1] = rgb[1];   // G
-            dst[col * 4 + 2] = rgb[0];   // R
-            dst[col * 4 + 3] = 0xFF;
+
+        if (bpp == 4) {
+            for (int32_t col = 0; col < width; col++) {
+                uint32_t px;
+                memcpy(&px, src, sizeof(px));
+                if (!mem_bgr)
+                    px = (px & 0xFF00FF00u) | ((px & 0x000000FFu) << 16)
+                       | ((px & 0x00FF0000u) >> 16);
+                px |= 0xFF000000u;              // RemoteFX ignores this byte
+                memcpy(dst, &px, sizeof(px));
+                src += 4;
+                dst += 4;
+            }
+        } else if (mem_bgr) {
+            for (int32_t col = 0; col < width; col++) {
+                uint32_t px = 0xFF000000u
+                            | (uint32_t)src[0]
+                            | ((uint32_t)src[1] << 8)
+                            | ((uint32_t)src[2] << 16);
+                memcpy(dst, &px, sizeof(px));
+                src += 3;
+                dst += 4;
+            }
+        } else {
+            for (int32_t col = 0; col < width; col++) {
+                uint32_t px = 0xFF000000u
+                            | (uint32_t)src[2]
+                            | ((uint32_t)src[1] << 8)
+                            | ((uint32_t)src[0] << 16);
+                memcpy(dst, &px, sizeof(px));
+                src += 3;
+                dst += 4;
+            }
         }
     }
 }
@@ -276,7 +317,9 @@ static bool send_frame(struct wr_server *s, const struct wr_frame *f, bool full)
     RFX_RECT rects[WR_MAX_DAMAGE];
     size_t count = 0;
 
-    if (full || f->damage_overflowed || f->damage_count == 0) {
+    if (!full && !f->damage_overflowed && f->damage_count == 0)
+        return true;    // the frame carries no damage: nothing changed
+    if (full || f->damage_overflowed) {
         mirror_rect(s, f, 0, 0, (int32_t)f->width, (int32_t)f->height);
         rects[count++] = (RFX_RECT){ 0, 0, (UINT16)f->width, (UINT16)f->height };
     } else {
@@ -702,7 +745,7 @@ static BOOL peer_activate(freerdp_peer *peer) {
 
     uint32_t width = wr_width(s->wayland), height = wr_height(s->wayland);
     if (!s->rfx) {
-        s->rfx = rfx_context_new(TRUE);
+        s->rfx = rfx_context_new_ex(TRUE, THREADING_FLAGS_DISABLE_THREADS);
         s->stream = Stream_New(NULL, 4 * 1024 * 1024);
         if (!s->rfx || !s->stream) {
             fprintf(stderr, "wayrdp: could not create the RemoteFX encoder\n");

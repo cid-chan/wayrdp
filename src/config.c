@@ -31,7 +31,7 @@ bool wr_config_load(struct wr_config *cfg, const char **error) {
     cfg->port = 3389;
     snprintf(cfg->bind_address, sizeof(cfg->bind_address), "0.0.0.0");
 
-    char dir[512];
+    char dir[256];
     state_dir(dir, sizeof(dir));
     snprintf(cfg->cert_path, sizeof(cfg->cert_path), "%s/tls.crt", dir);
     snprintf(cfg->key_path, sizeof(cfg->key_path), "%s/tls.key", dir);
@@ -109,7 +109,7 @@ static bool file_exists(const char *path) {
 bool wr_config_ensure_certificate(struct wr_config *cfg, const char **error) {
     if (file_exists(cfg->cert_path) && file_exists(cfg->key_path)) return true;
 
-    char dir[512];
+    char dir[256];
     state_dir(dir, sizeof(dir));
     if (mkdir(dir, 0700) != 0 && errno != EEXIST) {
         *error = "could not create ~/.local/share/wayrdp";

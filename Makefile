@@ -31,7 +31,10 @@ PROTO_OBJS  := $(PROTO_SRCS:.c=.o)
 DEPS    := wayland-client xkbcommon freerdp3 freerdp-server3 winpr3 libpipewire-0.3
 CFLAGS  ?= -O2
 CFLAGS  += -std=c11 -Wall -Wextra
-CPPFLAGS += -I$(GEN) -Isrc $(shell pkg-config --cflags $(DEPS))
+# Dependency headers go in as system headers: FreeRDP/WinPR mark parts of their
+# own API deprecated inside their own headers, and a -Werror build should not
+# fail on declarations the project does not even call.
+CPPFLAGS += -I$(GEN) -Isrc $(patsubst -I%,-isystem %,$(shell pkg-config --cflags $(DEPS)))
 LDLIBS  += $(shell pkg-config --libs $(DEPS))
 
 .PHONY: all clean protocols

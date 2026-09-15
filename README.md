@@ -103,6 +103,19 @@ RDP set-1 keyboard scancodes are translated to Linux evdev key codes. Extended
 keys are mapped explicitly, and modifier state is sent separately because the
 virtual-keyboard protocol does not derive it automatically.
 
+## Performance
+
+The RemoteFX encoder is created with threading disabled on purpose. FreeRDP's
+default WinPR thread pool spawns one worker per available CPU and, measured on a
+1080p output, contends badly enough that turning it off dropped the server's CPU
+roughly four times for the same frame rate. A single encoder thread is both
+cheaper and no slower here.
+
+The pixel repack into the BGRX32 mirror is likewise format-specialised: the
+compositor offers a single pixel format for the whole session, so the byte order
+and the 24- to 32-bit expansion are decided once per rectangle instead of being
+re-tested for every pixel.
+
 ## Protocols and libraries
 
 | Purpose | Interface or library | Role |

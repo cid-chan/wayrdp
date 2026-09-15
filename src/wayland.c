@@ -108,6 +108,12 @@ void wr_read_rgb(const uint8_t *p, uint32_t format, uint8_t out[3]) {
     }
 }
 
+bool wr_format_is_bgr(uint32_t format) {
+    return format == WL_SHM_FORMAT_RGB888 ||
+           format == WL_SHM_FORMAT_XRGB8888 ||
+           format == WL_SHM_FORMAT_ARGB8888;
+}
+
 // Monotonic milliseconds; only differences are meaningful.
 static int64_t now_ms(void) {
     struct timespec ts;

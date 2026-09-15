@@ -36,6 +36,10 @@ struct wr_frame {
 // encoder needs the same answer the probe does, and two copies drift.
 void wr_read_rgb(const uint8_t *pixel, uint32_t format, uint8_t out[3]);
 
+// True when the format's bytes are already B,G,R in memory (as RemoteFX wants),
+// so the RDP side can skip exchanging the red and blue halves when it repacks.
+bool wr_format_is_bgr(uint32_t format);
+
 struct wr_wayland;
 
 // Connect, bind, and say plainly which piece is missing when one is: each is a
