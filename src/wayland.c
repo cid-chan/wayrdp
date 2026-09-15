@@ -366,6 +366,28 @@ void wr_close(struct wr_wayland *w) {
 int wr_fd(const struct wr_wayland *w) { return wl_display_get_fd(w->display); }
 bool wr_flush(struct wr_wayland *w) { return wl_display_flush(w->display) >= 0; }
 bool wr_dispatch_pending(struct wr_wayland *w) {
+    // Dispatching alone never reads the socket, so a single unread Wayland
+    // message -- a stray reply to a capture frame that was already destroyed, a
+    // seat or output update -- leaves the display fd readable forever. The
+    // server's poll then returns at once on every turn and spins a core with no
+    // client connected. Read whatever has arrived, without blocking, and then
+    // dispatch it: this is the read half of the loop, not just the dispatch.
+    while (wl_display_prepare_read(w->display) != 0) {
+        if (wl_display_dispatch_pending(w->display) < 0) return false;
+    }
+
+    if (wl_display_flush(w->display) < 0 && errno != EAGAIN) {
+        wl_display_cancel_read(w->display);
+        return false;
+    }
+
+    struct pollfd pfd = { .fd = wl_display_get_fd(w->display), .events = POLLIN };
+    if (poll(&pfd, 1, 0) > 0) {
+        if (wl_display_read_events(w->display) < 0) return false;
+    } else {
+        wl_display_cancel_read(w->display);
+    }
+
     return wl_display_dispatch_pending(w->display) >= 0;
 }
 
